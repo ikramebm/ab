@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <title>ESP32-CAM WebRTC Stream</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            max-width: 800px;
+            margin: 20px auto;
+            text-align: center;
+            padding: 0 20px;
+        }
+        #videoStream {
+            max-width: 100%;
+            background-color: #f0f0f0;
+            border: 1px solid #ccc;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            margin: 20px 0;
+        }
+        .controls {
+            margin: 20px 0;
+        }
+        button {
+            margin: 0 10px;
+            padding: 10px 20px;
+            font-size: 16px;
+            cursor: pointer;
+            border: none;
+            border-radius: 4px;
+            transition: opacity 0.3s ease;
+        }
+        button:disabled {
+            opacity: 0.5;
+            cursor: not-allowed;
+        }
+        #startButton {
+            background-color: #4CAF50;
+            color: white;
+        }
+        #stopButton {
+            background-color: #f44336;
+            color: white;
+        }
+        .status {
+            margin: 10px 0;
+            padding: 10px;
+            border-radius: 4px;
+            transition: all 0.3s ease;
+        }
+        .connected {
+            background-color: #e8f5e9;
+            color: #2e7d32;
+        }
+        .disconnected {
+            background-color: #ffebee;
+            color: #c62828;
+        }
+        .error-message {
+            color: #f44336;
+            margin: 10px 0;
+            font-size: 14px;
+        }
+    </style>
+</head>
+<body>
+    <h1>ESP32-CAM WebRTC Stream</h1>
+    <div class="status" id="connectionStatus">En attente de connexion...</div>
+    <div id="errorMessage" class="error-message"></div>
+    <div class="controls">
+        <button id="startButton" disabled>Démarrer</button>
+        <button id="stopButton" disabled>Arrêter</button>
+    </div>
+    <video id="videoStream" autoplay playsinline></video>
+
+    <script>
+        const configuration = {
+            iceServers: [{
+                urls: 'turn:ikrame-s-websocket-server.glitch.me:3478',
+                username: 'admin',
+                credential: 'admin'
+            }]
+        };
+
+        let peerConnection = null;
+        let socket = null;
+        let reconnectAttempts = 0;
+        const maxReconnectAttempts = 5;
+        const reconnectDelay = 3000;
+
+        const videoElement = document.getElementById('videoStream');
+        const startButton = document.getElementById('startButton');
+        const stopButton = document.getElementById('stopButton');
+        const statusElement = document.getElementById('connectionStatus');
+        const errorElement = document.getElementById('errorMessage');
+
+        function updateStatus(message, isConnected) {
+            statusElement.textContent = message;
+            statusElement.className = 'status ' + (isConnected ? 'connected' : 'disconnected');
+        }
+
+        function showError(message) {
+            errorElement.textContent = message;
+            setTimeout(() => {
+                errorElement.textContent = '';
+            }, 5000);
+        }
+
+        async function startWebRTC() {
+            try {
+                if (peerConnection) {
+                    await stopWebRTC();
+                }
+
+                updateStatus('Initialisation de la connexion WebRTC...', false);
+                peerConnection = new RTCPeerConnection(configuration);
+                
+                peerConnection.ontrack = ({streams: [stream]}) => {
+                    videoElement.srcObject = stream;
+                    updateStatus('Flux vidéo connecté', true);
+                };
+
+                peerConnection.onicecandidate = ({candidate}) => {
+                    if (candidate && socket && socket.readyState === WebSocket.OPEN) {
+                        socket.send(JSON.stringify({
+                            type: 'webrtc-ice-candidate',
+                            candidate,
+                            target: 'esp32'
+                        }));
+                    }
+                };
+
+                peerConnection.oniceconnectionstatechange = () => {
+                    const state = peerConnection.iceConnectionState;
+                    updateStatus(`État de la connexion: ${state}`, state === 'connected');
+                    
+                    if (state === 'failed' || state === 'disconnected') {
+                        showError('La connexion a été perdue. Tentative de reconnexion...');
+                        restartWebRTC();
+                    }
+                };
+
+                const offer = await peerConnection.createOffer({
+                    offerToReceiveVideo: true,
+                    offerToReceiveAudio: false
+                });
+                await peerConnection.setLocalDescription(offer);
+                
+                if (socket && socket.readyState === WebSocket.OPEN) {
+                    socket.send(JSON.stringify({
+                        type: 'webrtc-offer',
+                        offer: peerConnection.localDescription
+                    }));
+                    startButton.disabled = true;
+                    stopButton.disabled = false;
+                } else {
+                    throw new Error('La connexion WebSocket n\'est pas établie');
+                }
+            } catch (error) {
+                console.error('Erreur lors de l\'initialisation WebRTC:', error);
+                showError(`Erreur de connexion: ${error.message}`);
+                updateStatus('Erreur de connexion', false);
+            }
+        }
+
+        async function stopWebRTC() {
+            try {
+                if (peerConnection) {
+                    peerConnection.close();
+                    peerConnection = null;
+                }
+                if (videoElement.srcObject) {
+                    const tracks = videoElement.srcObject.getTracks();
+                    tracks.forEach(track => track.stop());
+                    videoElement.srcObject = null;
+                }
+                startButton.disabled = false;
+                stopButton.disabled = true;
+                updateStatus('Connexion arrêtée', false);
+            } catch (error) {
+                console.error('Erreur lors de l\'arrêt de WebRTC:', error);
+                showError('Erreur lors de l\'arrêt du flux');
+            }
+        }
+
+        async function restartWebRTC() {
+            await stopWebRTC();
+            await new Promise(resolve => setTimeout(resolve, 1000));
+            await startWebRTC();
+        }
+
+        function connectWebSocket() {
+            if (socket && socket.readyState !== WebSocket.CLOSED) {
+                socket.close();
+            }
+
+            socket = new WebSocket('wss://ikrame-s-websocket-server.glitch.me');
+
+            socket.onopen = () => {
+                updateStatus('Connecté au serveur', true);
+                socket.send(JSON.stringify({type: 'register-web'}));
+                startButton.disabled = false;
+                reconnectAttempts = 0;
+            };
+
+            socket.onclose = () => {
+                updateStatus('Déconnecté du serveur', false);
+                startButton.disabled = true;
+                stopButton.disabled = true;
+
+                if (reconnectAttempts < maxReconnectAttempts) {
+                    reconnectAttempts++;
+                    setTimeout(() => {
+                        connectWebSocket();
+                    }, reconnectDelay);
+                } else {
+                    showError('Impossible de se reconnecter au serveur après plusieurs tentatives');
+                }
+            };
+
+            socket.onerror = (error) => {
+                console.error('Erreur WebSocket:', error);
+                showError('Erreur de connexion au serveur');
+            };
+
+            socket.onmessage = async (event) => {
+                try {
+                    const message = JSON.parse(event.data);
+                    
+                    switch(message.type) {
+                        case 'webrtc-answer':
+                            if (peerConnection && message.answer) {
+                                await peerConnection.setRemoteDescription(new RTCSessionDescription(message.answer));
+                            }
+                            break;
+
+                        case 'webrtc-ice-candidate':
+                            if (peerConnection && message.candidate) {
+                                try {
+                                    await peerConnection.addIceCandidate(new RTCIceCandidate(message.candidate));
+                                } catch (e) {
+                                    console.error('Erreur lors de l\'ajout du candidat ICE:', e);
+                                }
+                            }
+                            break;
+
+                        case 'peer-disconnected':
+                            if (message.peer === 'esp32') {
+                                updateStatus('ESP32-CAM déconnectée', false);
+                                await stopWebRTC();
+                            }
+                            break;
+
+                        case 'error':
+                            showError(message.message);
+                            break;
+                    }
+                } catch (error) {
+                    console.error('Erreur lors du traitement du message:', error);
+                    showError('Erreur lors du traitement des données');
+                }
+            };
+        }
+
+        // Gestionnaires d'événements des boutons
+        startButton.addEventListener('click', startWebRTC);
+        stopButton.addEventListener('click', stopWebRTC);
+
+        // Gestion de la fermeture de la page
+        window.addEventListener('beforeunload', () => {
+            if (socket) {
+                socket.close();
+            }
+            if (peerConnection) {
+                peerConnection.close();
+            }
+        });
+
+        // Démarrage initial
+        connectWebSocket();
+    </script>
+</body>
+</html>
